@@ -1,13 +1,13 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0">
     <modelVersion>4.0.0</modelVersion>
-    <groupId>com.neueda.leap</groupId>
+    <groupId>com</groupId>
     <artifactId>team-skeleton</artifactId>
     <version>0.1.0</version>
     <packaging>jar</packaging>
 
     <properties>
-        <maven.compiler.source>21</maven.compiler.source>
-        <maven.compiler.target>21</maven.compiler.target>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
@@ -21,7 +21,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>com.neueda.leap.Main</mainClass>
+                            <mainClass>com.Main</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
