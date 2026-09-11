@@ -4,15 +4,6 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto; -- for gen_random_uuid()
 
--- generic helper to keep updated_at columns current on any row change
-CREATE OR REPLACE FUNCTION set_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = now();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
 -- ============================================================
 -- users
 -- ============================================================
@@ -31,47 +22,43 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID NOT NULL REFERENCES users (user_id) ON DELETE RESTRICT,
     cash_balance    NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (cash_balance >= 0),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_suspended     BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts (user_id);
 
-DROP TRIGGER IF EXISTS trg_accounts_set_updated_at ON accounts;
-CREATE TRIGGER trg_accounts_set_updated_at
-    BEFORE UPDATE ON accounts
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
--- admins are staff, not traders, and must never hold a trading account
-CREATE OR REPLACE FUNCTION prevent_admin_account()
+-- analysts andadmins are staff, not traders, and must never hold a trading account
+CREATE OR REPLACE FUNCTION prevent_staff_account()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM users WHERE user_id = NEW.user_id AND role = 'admin') THEN
-        RAISE EXCEPTION 'admins cannot have trading accounts (user_id: %)', NEW.user_id;
+    IF EXISTS (SELECT 1 FROM users WHERE user_id = NEW.user_id AND role IN ('admin', 'analyst')) THEN
+        RAISE EXCEPTION 'staff cannot have trading accounts (user_id: %)', NEW.user_id;
     END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_prevent_admin_account ON accounts;
-CREATE TRIGGER trg_prevent_admin_account
+DROP TRIGGER IF EXISTS trg_prevent_staff_account ON accounts;
+CREATE TRIGGER trg_prevent_staff_account
     BEFORE INSERT OR UPDATE OF user_id ON accounts
-    FOR EACH ROW EXECUTE FUNCTION prevent_admin_account();
+    FOR EACH ROW EXECUTE FUNCTION prevent_staff_account();
 
--- block promoting a user to admin while they already own an account
-CREATE OR REPLACE FUNCTION prevent_admin_role_with_account()
+-- block promoting a user to staff while they already own an account
+CREATE OR REPLACE FUNCTION prevent_staff_role_with_account()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.role = 'admin' AND EXISTS (SELECT 1 FROM accounts WHERE user_id = NEW.user_id) THEN
-        RAISE EXCEPTION 'cannot set role to admin: user_id % already has a trading account', NEW.user_id;
+    IF NEW.role IN ('admin', 'analyst') AND EXISTS (SELECT 1 FROM accounts WHERE user_id = NEW.user_id) THEN
+        RAISE EXCEPTION 'cannot set role to staff: user_id % already has a trading account', NEW.user_id;
     END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_prevent_admin_role_with_account ON users;
-CREATE TRIGGER trg_prevent_admin_role_with_account
+DROP TRIGGER IF EXISTS trg_prevent_staff_role_with_account ON users;
+CREATE TRIGGER trg_prevent_staff_role_with_account
     BEFORE INSERT OR UPDATE OF role ON users
-    FOR EACH ROW EXECUTE FUNCTION prevent_admin_role_with_account();
+    FOR EACH ROW EXECUTE FUNCTION prevent_staff_role_with_account();
 
 -- ============================================================
 -- instruments (populated from a permitted-instruments list)
@@ -83,7 +70,7 @@ CREATE TABLE IF NOT EXISTS instruments (
     security_type   VARCHAR(30) NOT NULL CHECK (security_type IN ('equity', 'etf', 'bond', 'option', 'future', 'crypto', 'mutual_fund')),
     exchange        VARCHAR(50),
     currency        VARCHAR(10) NOT NULL DEFAULT 'USD',
-    isin            VARCHAR(20) UNIQUE,
+    isin            VARCHAR(12) CHECK (isin ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$') UNIQUE, -- International Securities Identification Number
     is_active       BOOLEAN NOT NULL DEFAULT TRUE
 );
 
@@ -97,28 +84,54 @@ CREATE TABLE IF NOT EXISTS orders (
     order_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id      UUID NOT NULL REFERENCES accounts (account_id) ON DELETE RESTRICT,
     instrument_id   UUID NOT NULL REFERENCES instruments (instrument_id) ON DELETE RESTRICT,
-    quantity        INT NOT NULL CHECK (quantity > 0),
+    quantity        NUMERIC(18, 4) NOT NULL CHECK (quantity > 0), -- allow fractional quantities
     order_side      VARCHAR(10) NOT NULL CHECK (order_side IN ('buy', 'sell')),
     order_type      VARCHAR(20) NOT NULL CHECK (order_type IN ('market', 'limit', 'stop', 'stop_limit')),
     limit_price     NUMERIC(18, 4) CHECK (limit_price > 0),
     stop_price      NUMERIC(18, 4) CHECK (stop_price > 0),
     price           NUMERIC(18, 4) CHECK (price > 0), -- execution price, filled in by middle-tier once order fills
     status          VARCHAR(20) NOT NULL DEFAULT 'submitted' CHECK (status IN ('submitted', 'accepted', 'rejected', 'filled', 'cancelled')),
+    rejection_reason  VARCHAR(255) CHECK (status <> 'rejected' OR rejection_reason IS NOT NULL), -- reason for order rejection, if applicable
     order_date      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (order_type NOT IN ('limit', 'stop_limit') OR limit_price IS NOT NULL),
-    CHECK (order_type NOT IN ('stop', 'stop_limit') OR stop_price IS NOT NULL)
+    CHECK (order_type NOT IN ('stop', 'stop_limit') OR stop_price IS NOT NULL),
+    CHECK (status <> 'filled' OR price IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_account_id ON orders (account_id);
 CREATE INDEX IF NOT EXISTS idx_orders_instrument_id ON orders (instrument_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
 CREATE INDEX IF NOT EXISTS idx_orders_order_date ON orders (order_date);
+CREATE INDEX IF NOT EXISTS idx_orders_account_id_order_date ON orders (account_id, order_date DESC);
+
+-- generic helper to keep updated_at columns current on any row change
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_orders_set_updated_at ON orders;
 CREATE TRIGGER trg_orders_set_updated_at
     BEFORE UPDATE ON orders
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- trigger to update the account's updated_at timestamp whenever a new order is inserted
+CREATE OR REPLACE FUNCTION touch_account_on_order()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE accounts SET updated_at = now() WHERE account_id = NEW.account_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+ 
+DROP TRIGGER IF EXISTS trg_touch_account_on_order ON orders;
+CREATE TRIGGER trg_touch_account_on_order
+    AFTER INSERT ON orders
+    FOR EACH ROW EXECUTE FUNCTION touch_account_on_order();
 
 -- ============================================================
 -- transactions (cash/instrument events not tied to a buy/sell order)
@@ -137,6 +150,35 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS idx_transactions_account_id ON transactions (account_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_txn_type ON transactions (txn_type);
 CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions (created_at);
+CREATE INDEX IF NOT EXISTS idx_transactions_instrument_id ON transactions (instrument_id) WHERE instrument_id IS NOT NULL;
+
+-- transactions are part of the permanent record (BR-14): no edits, ever
+CREATE OR REPLACE FUNCTION block_transaction_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'transactions are append-only and cannot be updated or deleted (transaction_id: %)',
+        OLD.transaction_id;
+END;
+$$ LANGUAGE plpgsql;
+ 
+DROP TRIGGER IF EXISTS trg_block_transaction_update ON transactions;
+CREATE TRIGGER trg_block_transaction_update
+    BEFORE UPDATE OR DELETE ON transactions
+    FOR EACH ROW EXECUTE FUNCTION block_transaction_mutation();
+ 
+-- stamp the owning account's updated_at the moment a transaction is placed
+CREATE OR REPLACE FUNCTION touch_account_on_transaction()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE accounts SET updated_at = now() WHERE account_id = NEW.account_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+ 
+DROP TRIGGER IF EXISTS trg_touch_account_on_transaction ON transactions;
+CREATE TRIGGER trg_touch_account_on_transaction
+    AFTER INSERT ON transactions
+    FOR EACH ROW EXECUTE FUNCTION touch_account_on_transaction();
 
 -- ============================================================
 -- holdings (current position per account/instrument)
